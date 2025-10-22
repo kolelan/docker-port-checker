@@ -1,0 +1,67 @@
+services:
+  php-cli:
+    build:
+      context: .
+      dockerfile: app/docker/Dockerfile
+    ports:
+      - "9001:9003"
+    volumes:
+      - ./app:/app/
+    tty: true
+    working_dir: /app
+    environment:
+      - COMPOSER_ALLOW_SUPERUSER=1
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - bridge_network
+
+  db:
+    image: postgres:13-alpine
+    container_name: postgres13
+    environment:
+      POSTGRES_USER: your_username
+      POSTGRES_PASSWORD: your_password
+      POSTGRES_DB: your_database_name
+    ports:
+      - "5439:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./init-db:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "your_username", "-d", "your_database_name"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - bridge_network
+
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - bridge_network
+  pgadmin:
+    image: dpage/pgadmin4
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: 12345678
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    ports:
+      - "5159:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      - db
+    networks:
+      - bridge_network
+
+volumes:
+  db_data:
+  pgadmin_data:
+
+networks:
+  bridge_network:
+    driver: bridge
