@@ -30,28 +30,39 @@ get_ports_from_compose() {
     local file="$1"
     local ports=()
 
-    # Ищем строки с портами в форматах:
-    # - "8080:80"
-    # - "8080:80/tcp"
-    # - "8080:80/udp"
-    # - "3000-3005:3000-3005"
-    while IFS= read -r line; do
-        # Обрабатываем строки с портами
-        if [[ $line =~ [[:space:]]*\"*([0-9]+(-[0-9]+)*):([0-9]+(-[0-9]+)*)(/[a-zA-Z]+)*\"* ]]; then
-            local host_port="${BASH_REMATCH[1]}"
+    # Используем yq для парсинга YAML (если установлен)
+    if command -v yq >/dev/null 2>&1; then
+        echo -e "${BLUE}Используем yq для парсинга YAML...${NC}" >&2
+        while IFS= read -r port_mapping; do
+            if [[ -n "$port_mapping" ]]; then
+                # Извлекаем хост-порт из формата "host:container"
+                host_port=$(echo "$port_mapping" | cut -d':' -f1)
+                # Убираем кавычки если есть
+                host_port=$(echo "$host_port" | sed "s/['\"]//g")
 
-            # Обрабатываем диапазоны портов
-            if [[ $host_port =~ ^([0-9]+)-([0-9]+)$ ]]; then
-                local start_port="${BASH_REMATCH[1]}"
-                local end_port="${BASH_REMATCH[2]}"
-                for port in $(seq "$start_port" "$end_port"); do
-                    ports+=("$port")
-                done
-            else
+                # Обрабатываем диапазоны портов
+                if [[ $host_port =~ ^([0-9]+)-([0-9]+)$ ]]; then
+                    local start_port="${BASH_REMATCH[1]}"
+                    local end_port="${BASH_REMATCH[2]}"
+                    for port in $(seq "$start_port" "$end_port"); do
+                        ports+=("$port")
+                    done
+                elif [[ $host_port =~ ^[0-9]+$ ]]; then
+                    ports+=("$host_port")
+                fi
+            fi
+        done < <(yq e '.services[].ports[]' "$file" 2>/dev/null | grep -v null)
+    else
+        # Альтернативный метод через grep (более простой, но менее надежный)
+        echo -e "${YELLOW}yq не установлен, используем grep для парсинга...${NC}" >&2
+        while IFS= read -r line; do
+            # Ищем строки с портами в форматах: "HOST:CONTAINER", 'HOST:CONTAINER', HOST:CONTAINER
+            if [[ $line =~ \ *-\ *[\"\']?([0-9]+)(-[0-9]+)?:([0-9]+) ]]; then
+                host_port="${BASH_REMATCH[1]}"
                 ports+=("$host_port")
             fi
-        fi
-    done < <(grep -E "[[:space:]]*ports:" -A 20 "$file" | grep -E "[[:space:]]*-\s+")
+        done < <(grep -E "ports:" -A 20 "$file" | grep -E "[[:space:]]*-\s+[\"']?[0-9]+:" | sed "s/[\"']//g")
+    fi
 
     # Убираем дубликаты и сортируем
     printf '%s\n' "${ports[@]}" | sort -nu
@@ -65,12 +76,12 @@ check_port() {
     # Проверяем, слушает ли порт какой-либо процесс
     if command -v ss >/dev/null 2>&1; then
         # Используем ss (более современная утилита)
-        result=$(ss -tulpn 2>/dev/null | grep ":$port " || true)
+        result=$(ss -tulpn 2>/dev/null | grep -E ":$port[[:space:]]" || true)
     elif command -v netstat >/dev/null 2>&1; then
         # Используем netstat (устаревшая, но широко доступная)
-        result=$(netstat -tulpn 2>/dev/null | grep ":$port " || true)
+        result=$(netstat -tulpn 2>/dev/null | grep -E ":$port[[:space:]]" || true)
     else
-        echo -e "${YELLOW}Предупреждение: Не найдены утилиты ss или netstat${NC}"
+        echo -e "${YELLOW}Предупреждение: Не найдены утилиты ss или netstat${NC}" >&2
         return 1
     fi
 
@@ -85,7 +96,7 @@ check_port() {
 # Функция для получения информации о контейнере по порту
 get_container_by_port() {
     local port="$1"
-    docker ps --format "table {{.Names}}\t{{.Ports}}" 2>/dev/null | grep ":$port->" || true
+    docker ps --format "table {{.Names}}\t{{.Ports}}" 2>/dev/null | grep -E ":$port->" || true
 }
 
 # Функция для получения детальной информации о процессе
@@ -99,7 +110,7 @@ get_process_info() {
         # Получаем информацию о процессе
         if [[ -f "/proc/$pid/comm" ]]; then
             local process_name=$(cat "/proc/$pid/comm" 2>/dev/null || echo "неизвестно")
-            local cmdline=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ' || echo "неизвестно")
+            local cmdline=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ' | head -c 100 || echo "неизвестно")
             echo "PID: $pid, Процесс: $process_name, Команда: $cmdline"
         else
             echo "PID: $pid (процесс не найден)"
@@ -132,9 +143,7 @@ main() {
             echo -n "Проверка порта $port... "
 
             local port_info
-            port_info=$(check_port "$port")
-
-            if [[ -n "$port_info" ]]; then
+            if port_info=$(check_port "$port"); then
                 echo -e "${RED}ЗАНЯТ${NC}"
                 occupied_ports+=("$port:$port_info")
             else
@@ -177,7 +186,7 @@ main() {
     # Выводим информацию о свободных портах
     if [[ ${#free_ports[@]} -gt 0 ]]; then
         echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
-        echo -e "${GREEN}║                 СВОБОДНЫЕ ПОРТЫ                            ║${NC}"
+        echo -e "${GREEN}║                 СВОБОДНЫЕ ПОРТЫ                              ║${NC}"
         echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
         printf '%s\n' "${free_ports[@]}"
         echo
@@ -194,4 +203,4 @@ main() {
 }
 
 # Запуск основной функции
-main
+main "$@"
